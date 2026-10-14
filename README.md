@@ -11,3 +11,6 @@ Tervezett funkciók:
 
 Kép forrása:
 pexels.com
+
+Requirementsek telepítése:
+python -m pip install -r requirements.txt
