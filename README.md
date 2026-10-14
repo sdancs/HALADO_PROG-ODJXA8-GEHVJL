@@ -8,3 +8,6 @@ Tervezett funkciók:
 -járművek felismerése
 -szabad helyek meghatározása
 -eredmény megjelenítése
+
+Kép forrása:
+pexels.com
