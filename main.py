@@ -1,20 +1,19 @@
 
 from pathlib import Path
 import math
-
+import numpy as np
 from PIL import Image, ImageDraw, ImageFont, UnidentifiedImageError
 from ultralytics import YOLO
 
 
 # A projekt főmappája
 PROJECT_DIR = Path(__file__).resolve().parent
-
 # Bemeneti és kimeneti képek
 IMAGE_PATH = PROJECT_DIR / "adatok" / "parhuzamos.jpg"
 OUTPUT_PATH = PROJECT_DIR / "adatok" / "autok_eredmeny.jpg"
 
 # Előre betanított YOLO modell
-MODEL_NAME = "yolov8n.pt"
+MODEL_NAME = "yolo26x-seg.pt"
 
 # Felismerendő járműkategóriák
 VEHICLE_CLASSES = {
@@ -24,8 +23,10 @@ VEHICLE_CLASSES = {
     7: "truck",
 }
 
-# A járműkeretek oldalankénti csökkentésének aránya
-BOX_SHRINK_RATIO = 0.20
+# Szegmentálás beállításai
+CONFIDENCE = 0.50
+MASK_SHRINK_RATIO = 0.00
+gap_multip = 1
 
 # A minimális rés a két jármű átlagos méretéhez képest
 PARKING_GAP_RATIO = 0.50
@@ -60,32 +61,23 @@ def load_image(image_path):
         ) from error
 
 
-# A YOLO által meghatározott keret összehúzása
-def shrink_bbox(bbox, image_width, image_height):
-    # A keret koordinátái
-    x1, y1, x2, y2 = bbox
+# A szegmentált maszk befoglaló keretének meghatározása
+def mask_bbox(mask):
+    # A nem üres maszkpixelek koordinátái
+    ys, xs = np.where(mask > 0)
 
-    # A keret szélessége és magassága
-    width = x2 - x1
-    height = y2 - y1
+    # Üres maszk ellenőrzése
+    if not len(xs):
+        return None
 
-    # A levágás mértéke oldalanként
-    cut_x = width * BOX_SHRINK_RATIO
-    cut_y = height * BOX_SHRINK_RATIO
+    # A maszk szélei
+    x1, y1, x2, y2 = xs.min(), ys.min(), xs.max() + 1, ys.max() + 1
 
-    # A keret összehúzása
-    x1 = round(x1 + cut_x)
-    y1 = round(y1 + cut_y)
-    x2 = round(x2 - cut_x)
-    y2 = round(y2 - cut_y)
+    # Opcionális belső szűkítés (0.00 esetén nincs összehúzás)
+    dx = (x2 - x1) * MASK_SHRINK_RATIO
+    dy = (y2 - y1) * MASK_SHRINK_RATIO
 
-    # A koordinátákat a kép határain belül tartjuk
-    x1 = max(0, min(x1, image_width - 1))
-    y1 = max(0, min(y1, image_height - 1))
-    x2 = max(x1 + 1, min(x2, image_width))
-    y2 = max(y1 + 1, min(y2, image_height))
-
-    return x1, y1, x2, y2
+    return round(x1 + dx), round(y1 + dy), round(x2 - dx), round(y2 - dy)
 
 
 #A járművek közötti rések és férőhelyek meghatározása
@@ -130,10 +122,10 @@ def find_parking_spaces(vehicles):
         reference_size = (left_size + right_size) / 2
 
         # A minimális rés kiszámítása
-        min_gap = reference_size * PARKING_GAP_RATIO
+        min_gap = reference_size * PARKING_GAP_RATIO * gap_multip
 
         #!!!!!!!!!Egy becsült parkolóhely szükséges szélessége
-        estimated_slot_width = min_gap * 2.45
+        estimated_slot_width = min_gap
 
         # A járművek függőleges középpontja
         left_center_y = (ly1 + ly2) / 2
@@ -218,259 +210,210 @@ def find_parking_spaces(vehicles):
 
 
 def detect_vehicles(image_path, model_name=MODEL_NAME):
-    # Betöltjük a YOLO modellt
+    # Betöltjük a YOLO szegmentáló modellt
     model = YOLO(model_name)
 
-    # Lefuttatjuk a járműfelismerést
-    results = model(str(image_path), verbose=False)
-    result = results[0]
+    # Lefuttatjuk a járművek szegmentálását
+    result = model.predict(
+        source=str(image_path),
+        conf=CONFIDENCE,
+        verbose=False
+    )[0]
+
+    # Eredeti kép és átlátszó maszk-réteg
+    image = Image.open(image_path).convert("RGBA")
+    image_width, image_height = image.size
+    overlay = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    mask_draw = ImageDraw.Draw(overlay)
 
     # A felismert járművek listája
     detected_vehicles = []
 
-    # Lekérjük a kép méretét
-    with Image.open(image_path) as image:
-        image_width, image_height = image.size
-
     # Végigmegyünk a felismert objektumokon
-    for box in result.boxes:
-        # A kategóriaazonosító
-        class_id = int(box.cls[0].item())
+    if result.boxes is not None and result.masks is not None:
+        for index, box in enumerate(result.boxes):
+            class_id = int(box.cls[0].item())
 
-        # Csak a járműkategóriákat tartjuk meg
-        if class_id in VEHICLE_CLASSES:
-            # A felismerés bizonyossága
-            confidence = float(box.conf[0].item())
+            # Csak a járműkategóriákat tartjuk meg
+            if class_id not in VEHICLE_CLASSES:
+                continue
 
-            # Az eredeti keret koordinátái
-            original_bbox = tuple(
-                round(coord)
-                for coord in box.xyxy[0].tolist()
+            # A szegmentációs maszk kontúrja
+            polygon = result.masks.xy[index]
+            if polygon is None or len(polygon) < 3:
+                continue
+
+            points = [(round(x), round(y)) for x, y in polygon]
+
+            # A kontúr alapján bináris maszkot készítünk
+            mask_image = Image.new("L", (image_width, image_height), 0)
+            ImageDraw.Draw(mask_image).polygon(points, fill=255)
+            mask = np.asarray(mask_image)
+
+            # A befoglaló keret a teljes maszkból készül, szűkítés nélkül
+            bbox = mask_bbox(mask)
+            if bbox is None:
+                continue
+
+            # Zöld, áttetsző kitöltés és kontúr
+            mask_draw.polygon(points, fill=(0, 255, 0, 65))
+            mask_draw.line(
+                points + [points[0]],
+                fill=(0, 255, 0, 230),
+                width=max(2, image_width // 500)
             )
 
-            # A keret összehúzása
-            bbox = shrink_bbox(
-                original_bbox,
-                image_width,
-                image_height
-            )
-
-            # A jármű adatainak eltárolása
             detected_vehicles.append({
                 "label": VEHICLE_CLASSES[class_id],
-                "confidence": confidence,
+                "confidence": float(box.conf[0].item()),
                 "bbox": bbox,
+                "mask": mask,
+                "polygon": points
             })
 
-    # Megkeressük a lehetséges szabad helyeket
-    parking_spaces, gap_checks = find_parking_spaces(
-        detected_vehicles
+    # A szegmentálás vizuális rétegét az eredeti képre helyezzük
+    annotated_image = Image.alpha_composite(image, overlay).convert("RGB")
+
+    # Balról jobbra rendezzük a járműveket
+    detected_vehicles.sort(
+        key=lambda vehicle: (vehicle["bbox"][0] + vehicle["bbox"][2]) / 2
     )
 
-    # Betöltjük az eredeti képet RGB formátumban
-    with Image.open(image_path) as image:
-        annotated_image = image.convert("RGB")
+    # Megkeressük a lehetséges szabad helyeket (main.py eredeti logikája)
+    parking_spaces, gap_checks = find_parking_spaces(detected_vehicles)
 
-    # Létrehozzuk a rajzoló objektumot
+    # Rajzoló és betűtípus
     draw = ImageDraw.Draw(annotated_image)
-
-    # A betűméretet a kép szélességéhez igazítjuk
     font_size = max(16, annotated_image.width // 50)
-
-    #Betűtípus betöltése
     try:
         font = ImageFont.truetype("arial.ttf", font_size)
     except OSError:
         font = ImageFont.load_default()
 
-    # Kirajzoljuk a járművek csökkentett kereteit
+    # A járművek teljes, összehúzás nélküli maszkkeretei és címkéi
     for vehicle in detected_vehicles:
         x1, y1, x2, y2 = vehicle["bbox"]
+        label_text = f"{vehicle['label']} {vehicle['confidence']:.0%}"
 
-        #A jármű címkéje
-        text = (
-            f"{vehicle['label']} "
-            f"{vehicle['confidence']:.0%}"
-        )
-
-        # Zöld keret a jármű körül
         draw.rectangle(
             (x1, y1, x2, y2),
             outline=(0, 255, 0),
-            width=max(2, annotated_image.width // 400),
+            width=max(2, annotated_image.width // 400)
         )
 
-        # A címke mérete
-        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_bbox = draw.textbbox((0, 0), label_text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
-
-        # A címkét a keret fölé helyezzük
         text_y = max(0, y1 - text_height - 8)
 
-        # Háttér a címke mögött
         draw.rectangle(
-            (
-                x1,
-                text_y,
-                x1 + text_width + 8,
-                text_y + text_height + 6,
-            ),
-            fill=(0, 180, 0),
+            (x1, text_y, x1 + text_width + 8, text_y + text_height + 6),
+            fill=(0, 180, 0)
         )
-
-        # A címke kiírása
         draw.text(
             (x1 + 4, text_y + 3),
-            text,
+            label_text,
             fill=(255, 255, 255),
-            font=font,
+            font=font
         )
 
-    # Kirajzoljuk az összes vizsgált rést
+    # A vizsgált rések kirajzolása a main.py eredeti módján
     for check in gap_checks:
-        # A két keret vizsgált széle
         left_x, left_y = check["left_edge"]
         right_x, right_y = check["right_edge"]
+        line_color = (0, 255, 0) if check["accepted"] else (255, 0, 0)
 
-        # Zöld vonal jelzi az elfogadott, piros az elutasított rést
-        line_color = (
-            (0, 255, 0)
-            if check["accepted"]
-            else (255, 0, 0)
-        )
-
-        # A két vizsgált szélt összekötő vonal
         draw.line(
             (left_x, left_y, right_x, right_y),
             fill=line_color,
-            width=4,
+            width=4
         )
-
-        # Függőleges jelölések a boxok szélén
         marker_size = 12
-
         draw.line(
-            (
-                left_x, left_y - marker_size,
-                left_x, left_y + marker_size,
-            ),
+            (left_x, left_y - marker_size, left_x, left_y + marker_size),
             fill=(255, 255, 0),
-            width=3,
+            width=3
+        )
+        draw.line(
+            (right_x, right_y - marker_size, right_x, right_y + marker_size),
+            fill=(255, 255, 0),
+            width=3
         )
 
-        draw.line(
-            (
-                right_x, right_y - marker_size,
-                right_x, right_y + marker_size,
-            ),
-            fill=(255, 255, 0),
-            width=3,
-        )
-
-        #A rés szélességét és a becsült férőhelyek számát is kiírjuk
         info_text = (
             f"res={check['gap']:.0f}px "
             f"min={check['min_gap']:.0f}px "
             f"helyek={check['slot_count']}"
         )
-
-        # A felirat középpontja
         text_x = round((left_x + right_x) / 2)
-        text_y = round(
-            (left_y + right_y) / 2
-        ) - font_size - 8
+        text_y = max(
+            0,
+            round((left_y + right_y) / 2) - font_size - 8
+        )
 
-        # A felirat mérete
         info_bbox = draw.textbbox((0, 0), info_text, font=font)
         info_width = info_bbox[2] - info_bbox[0]
         info_height = info_bbox[3] - info_bbox[1]
 
-        # A feliratot a képen belül tartjuk
-        text_y = max(0, text_y)
-
-        # Háttér a távolság feliratához
         draw.rectangle(
             (
                 text_x - info_width // 2 - 4,
                 text_y,
                 text_x + info_width // 2 + 4,
-                text_y + info_height + 6,
+                text_y + info_height + 6
             ),
-            fill=(0, 0, 0),
+            fill=(0, 0, 0)
         )
-
-        # A távolság felirata
         draw.text(
-            (
-                text_x - info_width // 2,
-                text_y + 2,
-            ),
+            (text_x - info_width // 2, text_y + 2),
             info_text,
             fill=line_color,
-            font=font,
+            font=font
         )
 
-        # A vizsgálat eredménye a konzolra
         print(
             f"Rés: {check['gap']:.1f}px | "
             f"Minimális küszöb: {check['min_gap']:.1f}px | "
             f"Becsült helyszélesség: {check['slot_width']:.1f}px | "
             f"Becsült férőhelyek: {check['slot_count']} | "
-            f"Függőleges eltérés: "
-            f"{check['vertical_offset']:.1f}px | "
+            f"Függőleges eltérés: {check['vertical_offset']:.1f}px | "
             f"Max.: {check['max_vertical_offset']:.1f}px | "
             f"Egy sorban: {check['same_row']} | "
             f"Elfogadva: {check['accepted']}"
         )
 
-    #Minden becsült férőhely közepére külön felirat kerül
+    # Minden becsült férőhely közepére felirat
     for space in parking_spaces:
         center_x, center_y = space["center"]
+        label_text = "1 szabad hely"
 
-        # A parkolóhely felirata
-        text = "1 szabad hely"
-
-        # A felirat mérete
-        text_bbox = draw.textbbox((0, 0), text, font=font)
+        text_bbox = draw.textbbox((0, 0), label_text, font=font)
         text_width = text_bbox[2] - text_bbox[0]
         text_height = text_bbox[3] - text_bbox[1]
-
-        # Középre igazítjuk a feliratot
         text_x = round(center_x - text_width / 2)
         text_y = round(center_y - text_height / 2)
-
-        # Háttér margója
         padding = 6
 
-        # Kék háttér a felirat mögött
         draw.rectangle(
             (
                 text_x - padding,
                 text_y - padding,
                 text_x + text_width + padding,
-                text_y + text_height + padding,
+                text_y + text_height + padding
             ),
-            fill=(0, 100, 255),
+            fill=(0, 100, 255)
         )
-
-        # A szabad hely felirata
         draw.text(
             (text_x, text_y),
-            text,
+            label_text,
             fill=(255, 255, 255),
-            font=font,
+            font=font
         )
 
-    # Az eredménykép mentése
-    annotated_image.save(
-        OUTPUT_PATH,
-        format="JPEG",
-        quality=95,
-    )
+    # Eredménykép mentése
+    annotated_image.save(OUTPUT_PATH, format="JPEG", quality=95)
 
-    # Eredmények kiírása
-    print(f"\nEredménykép elmentve: {OUTPUT_PATH}")
+    print(f"\\nEredménykép elmentve: {OUTPUT_PATH}")
     print(f"Felismert járművek: {len(detected_vehicles)} db")
     print(f"Becsült szabad parkolóhelyek: {len(parking_spaces)} db")
 
